@@ -27,21 +27,21 @@ def get_x2(cards, total):
 def get_y(cards):
     return 1 if sum(1 for c in cards if c != 0) > 2 else 0
 
-X, y = [], []
+x, y = [], []
 for _, row in df.iterrows():
     cards = [row[c] for c in card_cols]
     x1 = get_x1(cards)
     x2 = get_x2(cards, row["sumofcards"])
     label = get_y(cards)
-    X.append([x1, x2])
+    x.append([x1, x2])
     y.append(label)
     print(f"Processed hand: cards={cards}, x1={x1}, x2={x2}, y={label}")
 
-X = torch.tensor(X, dtype=torch.float32)
+x = torch.tensor(x, dtype=torch.float32)
 y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
 
 
-_ = input(f"Data preload finished with {len(X)} items, waiting press any key to load")
+_ = input(f"Data preload finished with {len(x)} items, waiting press any key to load")
 
 print("pressed key, loading..")
 
@@ -68,7 +68,7 @@ optimizer = optim.Adam(net.parameters(), lr=0.0001)
 
 epochs = 5000
 for epoch in range(epochs):
-    outputs = net(X)
+    outputs = net(x)
     loss = criterion(outputs, y)
     
     optimizer.zero_grad()
