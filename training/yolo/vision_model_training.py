@@ -26,7 +26,8 @@ command = [
     "--batch", str(BATCH_SIZE),
     "--epochs", str(EPOCHS),
     "--data", DATA_YAML_PATH,
-    "--weights", WEIGHTS,
+    "--weights", "",
+    "--cfg", "yolov5/models/yolov5m.yaml",  # need this for optional specification
     "--name", RUN_NAME
 ]
 
