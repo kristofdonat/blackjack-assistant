@@ -3,7 +3,7 @@ An AI assistant trained for the soul purpose of bringing you towards the winning
 
 ## Dataset
 
-The YOLOv5 model was trained on the [Cards Image Dataset-Classification](https://www.kaggle.com/datasets/gpiosenka/cards-image-datasetclassification/data) from Kaggle.
+The YOLOv5 & later YOLOv8 model was trained on the [Cards Image Dataset-Classification](https://www.kaggle.com/datasets/gpiosenka/cards-image-datasetclassification/data) from Kaggle.
 
 - Source: [Kaggle](https://www.kaggle.com/)
 - Dataset Author: gpiosenka
