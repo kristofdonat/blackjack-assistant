@@ -4,6 +4,7 @@ from ultralytics import YOLO
 from pathlib import Path
 import csv
 from datetime import datetime
+import math
 
 import torch
 import torch.nn as nn
@@ -20,7 +21,7 @@ class BlackjackNet(nn.Module):
             nn.Linear(16, 8),
             nn.ReLU(),
             nn.Linear(8, 1),
-            nn.Sigmoid()  # binary output: probability of drawing
+            nn.Sigmoid()
         )
 
     def forward(self, x):
@@ -76,7 +77,6 @@ def label_to_rank(label: str) -> str:
     Adjust this depending on how you named your YOLO classes.
     """
     label = label.strip().upper()
-
     # numeric at the start (2..10)
     if label[0].isdigit():
         digits = ""
@@ -86,9 +86,7 @@ def label_to_rank(label: str) -> str:
             else:
                 break
         return digits  # e.g. "10"
-    else:
-        # first letter for faces/ace (J,Q,K,A,...)
-        return label[0]  # "A", "K", etc.
+    return label[0]  # "A", "K", etc.
 
 
 def compute_hand_value(ranks):
@@ -112,53 +110,114 @@ def compute_hand_value(ranks):
 
     return total
 
-def unique_cards_by_track_id(results, yolo_model):
-    """
-    1 lap = 1 track_id.
-    Ha egy track_id-hoz több detekció is tartozik, a legnagyobb conf-ot tartjuk meg.
 
-    Return: list[dict] elemek:
-      {
-        "track_id": int,
-        "label": str,
-        "conf": float,
-        "bbox": (x1,y1,x2,y2)
-      }
+# -----------------------------
+#  HAND STATE (stabil, only grows)
+# -----------------------------
+def init_hand_state():
+    return {
+        "tracks": {},             # tid -> {seen, rank_votes, last_seen, last_center, confirmed_rank}
+        "hand_track_ids": set(),  # what tids are already in hand
+        "hand_ranks": [],         #hand (only grows)
+        "hand_rank_counts": {},   # rank -> count in hand (max_per_rank enforcement)
+        "confirmed_centers": {},  # tid -> (cx, cy) for sorting duplicates
+    }
+
+
+def update_hand_from_tracking(
+    results,
+    yolo_model,
+    frame_idx: int,
+    frame_shape,
+    hand_state: dict,
+    min_conf: float = 0.5,
+    stable_frames: int = 5,
+    vote_ratio: float = 0.7,
+    max_per_rank: int = 1,
+    drop_frames: int = 30,
+    min_center_dist_ratio: float = 0.08,
+):
     """
-    if results.boxes is None or len(results.boxes) == 0:
-        return []
+    Return:
+      ranks_sorted: a jelenlegi hand (csak bővül), rendezve
+      new_card_added: True ha MOST került be új kártya a hand-be
+      visible_any: True ha ebben a frame-ben láttunk legalább 1 (min_conf feletti) detekciót
+    """
+    h, w = frame_shape[:2]
+    min_center_dist = max(h, w) * min_center_dist_ratio
 
     boxes = results.boxes
-    if boxes.id is None:   # ha valamiért nincs tracking id
-        # fallback: sima detekciók (track nélkül)
-        out = []
-        for i in range(len(boxes)):
-            cls_id = int(boxes.cls[i].item())
-            conf = float(boxes.conf[i].item())
-            label = yolo_model.names[cls_id]
-            x1, y1, x2, y2 = boxes.xyxy[i].tolist()
-            out.append({"track_id": i, "label": label, "conf": conf, "bbox": (x1,y1,x2,y2)})
-        return out
+    if boxes is None or len(boxes) == 0:
+        return sorted(hand_state["hand_ranks"]), False, False
 
-    best = {}  # track_id -> dict
+    # tracking id-s
+    if boxes.id is None:
+        # without tracking, we cannot maintain hand state
+        return sorted(hand_state["hand_ranks"]), False, True
+
+    visible_any = False
+    new_card_added = False
 
     for i in range(len(boxes)):
+        conf = float(boxes.conf[i].item())
+        if conf < min_conf:
+            continue
+
+        visible_any = True
+
         tid = int(boxes.id[i].item())
         cls_id = int(boxes.cls[i].item())
-        conf = float(boxes.conf[i].item())
         label = yolo_model.names[cls_id]
+        rank = label_to_rank(label)
+
         x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
 
-        # tartsuk meg track-enként a legjobb conf-ot
-        if (tid not in best) or (conf > best[tid]["conf"]):
-            best[tid] = {
-                "track_id": tid,
-                "label": label,
-                "conf": conf,
-                "bbox": (x1, y1, x2, y2),
-            }
+        tr = hand_state["tracks"].setdefault(
+            tid,
+            {
+                "seen": 0,
+                "rank_votes": {},
+                "last_seen": frame_idx,
+                "last_center": (cx, cy),
+                "confirmed_rank": None,
+            },
+        )
+        tr["seen"] += 1
+        tr["last_seen"] = frame_idx
+        tr["last_center"] = (cx, cy)
+        tr["rank_votes"][rank] = tr["rank_votes"].get(rank, 0) + 1
 
-    return list(best.values())
+        # stable enough to confirm rank?
+        if tr["confirmed_rank"] is None and tr["seen"] >= stable_frames:
+            best_rank, best_cnt = max(tr["rank_votes"].items(), key=lambda kv: kv[1])
+            if best_cnt / tr["seen"] >= vote_ratio:
+                tr["confirmed_rank"] = best_rank
+
+                # sort duplicated tracks if they are too close to each other
+                too_close = False
+                for _, (ex, ey) in hand_state["confirmed_centers"].items():
+                    if math.dist((cx, cy), (ex, ey)) < min_center_dist:
+                        too_close = True
+                        break
+
+                # only add to hand once
+                current_cnt = hand_state["hand_rank_counts"].get(best_rank, 0)
+                if (not too_close) and (tid not in hand_state["hand_track_ids"]) and (current_cnt < max_per_rank):
+                    hand_state["hand_track_ids"].add(tid)
+                    hand_state["hand_ranks"].append(best_rank)
+                    hand_state["hand_rank_counts"][best_rank] = current_cnt + 1
+                    hand_state["confirmed_centers"][tid] = (cx, cy)
+                    new_card_added = True
+
+    # clean old tracks
+    old = [tid for tid, tr in hand_state["tracks"].items() if frame_idx - tr["last_seen"] > drop_frames]
+    for tid in old:
+        hand_state["tracks"].pop(tid, None)
+
+    return sorted(hand_state["hand_ranks"]), new_card_added, visible_any
+
 
 # -----------------------------
 #  MAIN LOGIC
@@ -167,9 +226,7 @@ def unique_cards_by_track_id(results, yolo_model):
 def main(video_source, model_weights, policy_model_path, log_dir):
     # Load YOLO model
     yolo_model = YOLO(model_weights)
-    yolo_model.conf = 0.5  # confidence threshold (tune if needed)
 
-    # Load decision (draw?) model
     policy_net = load_policy_model(policy_model_path)
 
     # Prepare logging
@@ -177,22 +234,25 @@ def main(video_source, model_weights, policy_model_path, log_dir):
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"blackjack_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-    # Structure: list of dict states
-    all_states = []  # each row corresponds to one "snapshot" during a hand
+    # log data per hand
+    hands_log = []
 
     # Hand tracking
     current_hand_id = 0
     current_hand_active = False
-    last_cards_snapshot = []
     no_card_frames = 0
-    candidate_snapshot = None
-    candidate_frames = 0
-    STABLE_FRAMES = 5  # ennyi frame-en át legyen ugyanaz, hogy elfogadjuk
-    RESET_FRAMES = 10  # ennyi üres frame után nullázunk (nálad ez volt)
-    NO_CARD_FRAMES_TO_END_HAND = 10  # adjust (depends on FPS)
+
+    # tuning
+    RESET_FRAMES = 10
+    MIN_CONF = 0.5
+    STABLE_FRAMES = 5
+    VOTE_RATIO = 0.7
+    MIN_CENTER_DIST_RATIO = 0.08
 
     # Last display information
-    last_display_info = None  # (card_count, total_value, prob, decision_str, cards)
+    last_display_info = None  # (card_count, total_value, prob, decision, ranks_sorted)
+    hand_state = init_hand_state()
+    frame_idx = 0
 
     # Open video source
     cap = cv2.VideoCapture(video_source)
@@ -207,64 +267,62 @@ def main(video_source, model_weights, policy_model_path, log_dir):
         if not ret:
             break
 
-        # YOLO inference (single result)
+        frame_idx += 1
+
+        # YOLO tracking (BoT-SORT default, ByteTrack if tracker=bytetrack.yaml) :contentReference[oaicite:1]{index=1}
         results = yolo_model.track(
             frame,
-            persist=True,          # tracking introduced
+            persist=True,
             tracker="bytetrack.yaml",  # or "botsort.yaml"
+            conf=MIN_CONF,
             verbose=False
         )[0]
 
-        # Extract labels from detections
-        detected_labels = []
-        if results.boxes is not None and len(results.boxes) > 0:
-            for cls_idx in results.boxes.cls:
-                cls_idx = int(cls_idx.item())
-                label = yolo_model.names[cls_idx]
-                detected_labels.append(label)
+        ranks_sorted, new_added, visible_any = update_hand_from_tracking(
+            results, yolo_model, frame_idx, frame.shape, hand_state,
+            min_conf=MIN_CONF,
+            stable_frames=STABLE_FRAMES,
+            vote_ratio=VOTE_RATIO,
+            min_center_dist_ratio=MIN_CENTER_DIST_RATIO,
+            max_per_rank=1,
+        )
 
-        # Convert labels -> ranks
-        filtered = unique_cards_by_track_id(results, yolo_model)
-        ranks = [label_to_rank(d["label"]) for d in filtered]
-        # ranks = [label_to_rank(lbl) for lbl in detected_labels]
-
-        # Determine if we see any cards
-        ranks_sorted = sorted(ranks)
-
-        if len(ranks_sorted) == 0:
+        # end of hand detection
+        if not visible_any:
             no_card_frames += 1
-
-            # if no cards for a while, end hand
             if no_card_frames >= RESET_FRAMES:
                 if current_hand_active:
-                    print(f"--- End of hand {current_hand_id} ---")
-                current_hand_active = False
-                last_cards_snapshot = []
-                last_display_info = None
+                    # close out current hand
+                    final_cards = sorted(hand_state["hand_ranks"])
+                    card_count = len(final_cards)
+                    total_value = compute_hand_value(final_cards)
+                    prob_draw = predict_draw(policy_net, card_count, total_value) if card_count > 0 else 0.0
+                    decision = "YES" if prob_draw >= 0.5 else "NO"
 
-                # stabilization reset
-                candidate_snapshot = None
-                candidate_frames = 0
+                    print(f"--- End of hand {current_hand_id} ---")
+
+                    hands_log.append({
+                        "hand_id": current_hand_id,
+                        "cards": " ".join(final_cards),
+                        "card_count": card_count,
+                        "total_value": total_value,
+                        "draw_probability": prob_draw,
+                        "draw_decision": decision,
+                    })
+
+                current_hand_active = False
+                last_display_info = None
+                hand_state = init_hand_state()
         else:
             no_card_frames = 0
 
-            # new hand started
             if not current_hand_active:
                 current_hand_id += 1
                 current_hand_active = True
                 print(f"=== New hand started: {current_hand_id} ===")
 
-            # stabilizing logic
-            if candidate_snapshot != ranks_sorted:
-                candidate_snapshot = ranks_sorted
-                candidate_frames = 1
-            else:
-                candidate_frames += 1
-
-            # only log if stable and different from last logged state
-            if candidate_frames >= STABLE_FRAMES and ranks_sorted != last_cards_snapshot:
-                last_cards_snapshot = ranks_sorted
-
+            # only calculate and display when a new card is added
+            if new_added:
                 card_count = len(ranks_sorted)
                 total_value = compute_hand_value(ranks_sorted)
                 prob_draw = predict_draw(policy_net, card_count, total_value)
@@ -276,15 +334,6 @@ def main(video_source, model_weights, policy_model_path, log_dir):
                     f"draw?: {decision} ({prob_draw:.2f})"
                 )
 
-                all_states.append({
-                    "hand_id": current_hand_id,
-                    "cards": " ".join(ranks_sorted),
-                    "card_count": card_count,
-                    "total_value": total_value,
-                    "draw_probability": prob_draw,
-                    "draw_decision": decision,
-                })
-
                 last_display_info = (card_count, total_value, prob_draw, decision, ranks_sorted)
 
         # Annotate frame with YOLO + text
@@ -292,48 +341,17 @@ def main(video_source, model_weights, policy_model_path, log_dir):
 
         if last_display_info is not None:
             card_count, total_value, prob_draw, decision, ranks_sorted = last_display_info
-            text1 = f"Cards: {card_count}, Total: {total_value}"
-            text2 = f"Draw?: {decision} ({prob_draw:.2f})"
-            text3 = f"Cards: {' '.join(ranks_sorted)}"
+            cv2.putText(annotated_frame, f"Cards: {card_count}, Total: {total_value}",
+                        (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(annotated_frame, f"Draw?: {decision} ({prob_draw:.2f})",
+                        (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(annotated_frame, f"Cards: {' '.join(ranks_sorted)}",
+                        (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
 
-            cv2.putText(
-                annotated_frame,
-                text1,
-                (20, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                annotated_frame,
-                text2,
-                (20, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                annotated_frame,
-                text3,
-                (20, 90),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
+        cv2.imshow(f"Blackjack card detection (YOLO) | model: {model_weights}", annotated_frame)
 
-        cv2.imshow(
-            f"Blackjack card detection (YOLOv8) | model: {model_weights}",
-            annotated_frame,
-        )
-
-        # Exit with 'q'
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), ord("Q")):
             break
 
     cap.release()
@@ -342,25 +360,16 @@ def main(video_source, model_weights, policy_model_path, log_dir):
     # Finalize: write CSV log
     with open(log_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            [
-                "hand_id",
-                "cards",
-                "card_count",
-                "total_value",
-                "draw_probability",
-                "draw_decision",
-            ]
-        )
-        for row in all_states:
+        writer.writerow(["hand_id", "cards", "card_count", "total_value", "draw_probability", "draw_decision"])
+        for row in hands_log:
             writer.writerow(
                 [
-                    row["hand_id"],
-                    row["cards"],
-                    row["card_count"],
-                    row["total_value"],
-                    f"{row['draw_probability']:.4f}",
-                    row["draw_decision"],
+                row["hand_id"],
+                row["cards"],
+                row["card_count"],
+                row["total_value"],
+                f"{row['draw_probability']:.4f}",
+                row["draw_decision"],
                 ]
             )
 
