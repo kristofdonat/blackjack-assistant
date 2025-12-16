@@ -62,17 +62,14 @@ def compute_hand_value(ranks: List[str]) -> int:
     """Standard blackjack scoring with Ace adjustment."""
     total = 0
     ace_count = 0
-
     for r in ranks:
         v = RANK_VALUE_MAP.get(r, 0)
         total += v
         if r == "A":
             ace_count += 1
-
     while total > 21 and ace_count > 0:
         total -= 10
         ace_count -= 1
-
     return total
 
 
@@ -108,12 +105,18 @@ def card_to_string(rank: str, suit: Optional[str]) -> str:
 # -----------------------------
 def init_hand_state():
     return {
-        "tracks": {}, # tid -> {seen, card_votes, last_seen, last_center, confirmed_card}
-        "hand_track_ids": set(), # Tracks already used to add a card
-        "hand_cards": [], # Cards in the hand: list of (rank, suit)
-        "hand_card_keys": set(), # Fast membership check: set of (rank, suit)
-        "confirmed_centers": {},  # tid -> (cx, cy) # Centers of accepted cards to suppress duplicate tracks of the same physical card
+        # tid -> {seen, card_votes, last_seen, last_center, confirmed_card}
+        "tracks": {},
+        # Tracks already used to add a card
+        "hand_track_ids": set(),
+        # Cards in the hand: list of (rank, suit)
+        "hand_cards": [],
+        # Fast membership check: set of (rank, suit)
+        "hand_card_keys": set(),
+        # Centers of accepted cards to suppress duplicate tracks of the same physical card
+        "confirmed_centers": {},  # tid -> (cx, cy)
     }
+
 
 def card_already_in_hand(hand_state, rank: str, suit: Optional[str]) -> bool:
     """
