@@ -112,6 +112,53 @@ def compute_hand_value(ranks):
 
     return total
 
+def unique_cards_by_track_id(results, yolo_model):
+    """
+    1 lap = 1 track_id.
+    Ha egy track_id-hoz több detekció is tartozik, a legnagyobb conf-ot tartjuk meg.
+
+    Return: list[dict] elemek:
+      {
+        "track_id": int,
+        "label": str,
+        "conf": float,
+        "bbox": (x1,y1,x2,y2)
+      }
+    """
+    if results.boxes is None or len(results.boxes) == 0:
+        return []
+
+    boxes = results.boxes
+    if boxes.id is None:   # ha valamiért nincs tracking id
+        # fallback: sima detekciók (track nélkül)
+        out = []
+        for i in range(len(boxes)):
+            cls_id = int(boxes.cls[i].item())
+            conf = float(boxes.conf[i].item())
+            label = yolo_model.names[cls_id]
+            x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+            out.append({"track_id": i, "label": label, "conf": conf, "bbox": (x1,y1,x2,y2)})
+        return out
+
+    best = {}  # track_id -> dict
+
+    for i in range(len(boxes)):
+        tid = int(boxes.id[i].item())
+        cls_id = int(boxes.cls[i].item())
+        conf = float(boxes.conf[i].item())
+        label = yolo_model.names[cls_id]
+        x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+
+        # tartsuk meg track-enként a legjobb conf-ot
+        if (tid not in best) or (conf > best[tid]["conf"]):
+            best[tid] = {
+                "track_id": tid,
+                "label": label,
+                "conf": conf,
+                "bbox": (x1, y1, x2, y2),
+            }
+
+    return list(best.values())
 
 # -----------------------------
 #  MAIN LOGIC
@@ -138,6 +185,10 @@ def main(video_source, model_weights, policy_model_path, log_dir):
     current_hand_active = False
     last_cards_snapshot = []
     no_card_frames = 0
+    candidate_snapshot = None
+    candidate_frames = 0
+    STABLE_FRAMES = 5  # ennyi frame-en át legyen ugyanaz, hogy elfogadjuk
+    RESET_FRAMES = 10  # ennyi üres frame után nullázunk (nálad ez volt)
     NO_CARD_FRAMES_TO_END_HAND = 10  # adjust (depends on FPS)
 
     # Last display information
@@ -157,7 +208,12 @@ def main(video_source, model_weights, policy_model_path, log_dir):
             break
 
         # YOLO inference (single result)
-        results = yolo_model(frame, verbose=False)[0]
+        results = yolo_model.track(
+            frame,
+            persist=True,          # tracking introduced
+            tracker="bytetrack.yaml",  # or "botsort.yaml"
+            verbose=False
+        )[0]
 
         # Extract labels from detections
         detected_labels = []
@@ -168,35 +224,45 @@ def main(video_source, model_weights, policy_model_path, log_dir):
                 detected_labels.append(label)
 
         # Convert labels -> ranks
-        ranks = [label_to_rank(lbl) for lbl in detected_labels]
+        filtered = unique_cards_by_track_id(results, yolo_model)
+        ranks = [label_to_rank(d["label"]) for d in filtered]
+        # ranks = [label_to_rank(lbl) for lbl in detected_labels]
 
         # Determine if we see any cards
-        if len(ranks) == 0:
-            # No cards in this frame
-            if current_hand_active:
-                no_card_frames += 1
-                if no_card_frames >= NO_CARD_FRAMES_TO_END_HAND:
-                    # End current hand
-                    print(f"--- End of hand {current_hand_id} ---")
-                    current_hand_active = False
-                    last_cards_snapshot = []
-                    last_display_info = None
-            else:
-                # No hand active; nothing to do
-                pass
-        else:
-            # We see at least one card
-            no_card_frames = 0
-            ranks_sorted = sorted(ranks)
+        ranks_sorted = sorted(ranks)
 
-            # Start a new hand if there is none active
+        if len(ranks_sorted) == 0:
+            no_card_frames += 1
+
+            # if no cards for a while, end hand
+            if no_card_frames >= RESET_FRAMES:
+                if current_hand_active:
+                    print(f"--- End of hand {current_hand_id} ---")
+                current_hand_active = False
+                last_cards_snapshot = []
+                last_display_info = None
+
+                # stabilization reset
+                candidate_snapshot = None
+                candidate_frames = 0
+        else:
+            no_card_frames = 0
+
+            # new hand started
             if not current_hand_active:
                 current_hand_id += 1
                 current_hand_active = True
                 print(f"=== New hand started: {current_hand_id} ===")
 
-            # If cards changed compared to last snapshot, create new state
-            if ranks_sorted != last_cards_snapshot:
+            # stabilizing logic
+            if candidate_snapshot != ranks_sorted:
+                candidate_snapshot = ranks_sorted
+                candidate_frames = 1
+            else:
+                candidate_frames += 1
+
+            # only log if stable and different from last logged state
+            if candidate_frames >= STABLE_FRAMES and ranks_sorted != last_cards_snapshot:
                 last_cards_snapshot = ranks_sorted
 
                 card_count = len(ranks_sorted)
@@ -204,32 +270,22 @@ def main(video_source, model_weights, policy_model_path, log_dir):
                 prob_draw = predict_draw(policy_net, card_count, total_value)
                 decision = "YES" if prob_draw >= 0.5 else "NO"
 
-                # Log to console
                 print(
                     f"Hand {current_hand_id} | cards: {ranks_sorted} | "
                     f"count: {card_count} | total: {total_value} | "
                     f"draw?: {decision} ({prob_draw:.2f})"
                 )
 
-                # Save state (for final CSV)
-                state_row = {
+                all_states.append({
                     "hand_id": current_hand_id,
                     "cards": " ".join(ranks_sorted),
                     "card_count": card_count,
                     "total_value": total_value,
                     "draw_probability": prob_draw,
                     "draw_decision": decision,
-                }
-                all_states.append(state_row)
+                })
 
-                # Update display info
-                last_display_info = (
-                    card_count,
-                    total_value,
-                    prob_draw,
-                    decision,
-                    ranks_sorted,
-                )
+                last_display_info = (card_count, total_value, prob_draw, decision, ranks_sorted)
 
         # Annotate frame with YOLO + text
         annotated_frame = results.plot()  # YOLO draws boxes and labels
