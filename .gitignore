@@ -208,3 +208,4 @@ __marimo__/
 .vscode/
 
 training/yolo/yolov5/*
+logs/*
