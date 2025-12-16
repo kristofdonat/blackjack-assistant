@@ -5,12 +5,13 @@ from pathlib import Path
 import csv
 from datetime import datetime
 import math
+from typing import Optional, Tuple, List
 
 import torch
 import torch.nn as nn
 
 # -----------------------------
-#  ML MODEL: "Húzzunk-e?" (x1 = card count, x2 = total value)
+#  POLICY MODEL: "Should we draw?" (x1 = card count, x2 = total value)
 # -----------------------------
 class BlackjackNet(nn.Module):
     def __init__(self):
@@ -43,8 +44,7 @@ def predict_draw(net: BlackjackNet, card_count: int, total_value: int) -> float:
     """
     with torch.no_grad():
         x = torch.tensor([[float(card_count), float(total_value)]])
-        prob = net(x).item()
-    return prob
+        return net(x).item()
 
 
 # -----------------------------
@@ -52,49 +52,14 @@ def predict_draw(net: BlackjackNet, card_count: int, total_value: int) -> float:
 # -----------------------------
 
 RANK_VALUE_MAP = {
-    "2": 2,
-    "3": 3,
-    "4": 4,
-    "5": 5,
-    "6": 6,
-    "7": 7,
-    "8": 8,
-    "9": 9,
-    "10": 10,
-    "J": 10,
-    "Q": 10,
-    "K": 10,
-    "A": 11,  # initially 11, we will adjust for bust
+    "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
+    "10": 10, "J": 10, "Q": 10, "K": 10,
+    "A": 11,
 }
 
 
-def label_to_rank(label: str) -> str:
-    """
-    Converts a YOLO class name to a rank.
-    Assumptions (adapt if needed):
-      - Labels like: "2", "3", ..., "10", "J", "Q", "K", "A"
-      - Or labels like: "10H", "AS", "KD" -> the rank is the numeric / first letter(s).
-    Adjust this depending on how you named your YOLO classes.
-    """
-    label = label.strip().upper()
-    # numeric at the start (2..10)
-    if label[0].isdigit():
-        digits = ""
-        for ch in label:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        return digits  # e.g. "10"
-    return label[0]  # "A", "K", etc.
-
-
-def compute_hand_value(ranks):
-    """
-    Standard blackjack value:
-    - Aces start as 11
-    - While total > 21 and we have aces counted as 11, subtract 10 for each.
-    """
+def compute_hand_value(ranks: List[str]) -> int:
+    """Standard blackjack scoring with Ace adjustment."""
     total = 0
     ace_count = 0
 
@@ -112,16 +77,52 @@ def compute_hand_value(ranks):
 
 
 # -----------------------------
-#  HAND STATE (stabil, only grows)
+#  LABEL PARSING: label -> (rank, suit)
+#  Your classes look like: '10c', 'Ah', 'Ks', ...
+# -----------------------------
+def label_to_card(label: str) -> Tuple[str, Optional[str]]:
+    """
+    Convert YOLO class name to (rank, suit).
+    Examples: '10c' -> ('10','c'), 'Ah' -> ('A','h')
+    """
+    s = label.strip()
+    if len(s) < 2:
+        return s.upper(), None
+
+    suit = s[-1].lower()  # c/d/h/s
+    rank = s[:-1].upper()  # '10','A','K','Q','J','2'...
+    if suit not in ("c", "d", "h", "s"):
+        # If for some reason suit isn't present, keep rank only
+        return s.upper(), None
+
+    return rank, suit
+
+
+def card_to_string(rank: str, suit: Optional[str]) -> str:
+    """Format a card for CSV logging."""
+    return f"{rank}{suit}" if suit else rank
+
+
+# -----------------------------
+#  HAND STATE (stable, only grows during a hand)
 # -----------------------------
 def init_hand_state():
     return {
-        "tracks": {},             # tid -> {seen, rank_votes, last_seen, last_center, confirmed_rank}
-        "hand_track_ids": set(),  # what tids are already in hand
-        "hand_ranks": [],         #hand (only grows)
-        "hand_rank_counts": {},   # rank -> count in hand (max_per_rank enforcement)
-        "confirmed_centers": {},  # tid -> (cx, cy) for sorting duplicates
+        "tracks": {}, # tid -> {seen, card_votes, last_seen, last_center, confirmed_card}
+        "hand_track_ids": set(), # Tracks already used to add a card
+        "hand_cards": [], # Cards in the hand: list of (rank, suit)
+        "hand_card_keys": set(), # Fast membership check: set of (rank, suit)
+        "confirmed_centers": {},  # tid -> (cx, cy) # Centers of accepted cards to suppress duplicate tracks of the same physical card
     }
+
+def card_already_in_hand(hand_state, rank: str, suit: Optional[str]) -> bool:
+    """
+    Decide if this (rank,suit) is already present in the current hand.
+    If suit is None, we conservatively treat ANY same-rank as present.
+    """
+    if suit is None:
+        return any(r == rank for (r, _s) in hand_state["hand_card_keys"])
+    return (rank, suit) in hand_state["hand_card_keys"]
 
 
 def update_hand_from_tracking(
@@ -133,27 +134,29 @@ def update_hand_from_tracking(
     min_conf: float = 0.5,
     stable_frames: int = 5,
     vote_ratio: float = 0.7,
-    max_per_rank: int = 1,
     drop_frames: int = 30,
     min_center_dist_ratio: float = 0.08,
 ):
     """
-    Return:
-      ranks_sorted: a jelenlegi hand (csak bővül), rendezve
-      new_card_added: True ha MOST került be új kártya a hand-be
-      visible_any: True ha ebben a frame-ben láttunk legalább 1 (min_conf feletti) detekciót
+    Update hand state using YOLO tracking output.
+
+    Returns:
+      ranks_sorted: current hand ranks (sorted)
+      new_card_added: True if a NEW card was added in this frame
+      visible_any: True if at least one detection >= min_conf is visible in this frame
     """
     h, w = frame_shape[:2]
     min_center_dist = max(h, w) * min_center_dist_ratio
 
     boxes = results.boxes
     if boxes is None or len(boxes) == 0:
-        return sorted(hand_state["hand_ranks"]), False, False
+        ranks_sorted = sorted([r for (r, _s) in hand_state["hand_cards"]])
+        return ranks_sorted, False, False
 
-    # tracking id-s
+    # Must have tracking IDs for stable per-object logic
     if boxes.id is None:
-        # without tracking, we cannot maintain hand state
-        return sorted(hand_state["hand_ranks"]), False, True
+        ranks_sorted = sorted([r for (r, _s) in hand_state["hand_cards"]])
+        return ranks_sorted, False, True
 
     visible_any = False
     new_card_added = False
@@ -168,7 +171,8 @@ def update_hand_from_tracking(
         tid = int(boxes.id[i].item())
         cls_id = int(boxes.cls[i].item())
         label = yolo_model.names[cls_id]
-        rank = label_to_rank(label)
+
+        rank, suit = label_to_card(label)
 
         x1, y1, x2, y2 = boxes.xyxy[i].tolist()
         cx = (x1 + x2) / 2.0
@@ -178,45 +182,52 @@ def update_hand_from_tracking(
             tid,
             {
                 "seen": 0,
-                "rank_votes": {},
+                "card_votes": {},      # (rank,suit) -> count
                 "last_seen": frame_idx,
                 "last_center": (cx, cy),
-                "confirmed_rank": None,
+                "confirmed_card": None,  # (rank,suit)
             },
         )
+
         tr["seen"] += 1
         tr["last_seen"] = frame_idx
         tr["last_center"] = (cx, cy)
-        tr["rank_votes"][rank] = tr["rank_votes"].get(rank, 0) + 1
 
-        # stable enough to confirm rank?
-        if tr["confirmed_rank"] is None and tr["seen"] >= stable_frames:
-            best_rank, best_cnt = max(tr["rank_votes"].items(), key=lambda kv: kv[1])
+        card_key = (rank, suit)
+        tr["card_votes"][card_key] = tr["card_votes"].get(card_key, 0) + 1
+
+        # Confirm a stable card identity for this track
+        if tr["confirmed_card"] is None and tr["seen"] >= stable_frames:
+            best_card, best_cnt = max(tr["card_votes"].items(), key=lambda kv: kv[1])
             if best_cnt / tr["seen"] >= vote_ratio:
-                tr["confirmed_rank"] = best_rank
+                tr["confirmed_card"] = best_card
+                best_rank, best_suit = best_card
 
-                # sort duplicated tracks if they are too close to each other
+                # Suppress duplicate tracks of the same physical card using center distance
+                # (This is a secondary safety net; main dedupe is by (rank,suit) uniqueness.)
                 too_close = False
                 for _, (ex, ey) in hand_state["confirmed_centers"].items():
                     if math.dist((cx, cy), (ex, ey)) < min_center_dist:
                         too_close = True
                         break
+                if too_close:
+                    continue
 
-                # only add to hand once
-                current_cnt = hand_state["hand_rank_counts"].get(best_rank, 0)
-                if (not too_close) and (tid not in hand_state["hand_track_ids"]) and (current_cnt < max_per_rank):
+                # Add as a new card only if not already present in this hand (rank+suit)
+                if (tid not in hand_state["hand_track_ids"]) and (not card_already_in_hand(hand_state, best_rank, best_suit)):
                     hand_state["hand_track_ids"].add(tid)
-                    hand_state["hand_ranks"].append(best_rank)
-                    hand_state["hand_rank_counts"][best_rank] = current_cnt + 1
+                    hand_state["hand_cards"].append((best_rank, best_suit))
+                    hand_state["hand_card_keys"].add((best_rank, best_suit))
                     hand_state["confirmed_centers"][tid] = (cx, cy)
                     new_card_added = True
 
-    # clean old tracks
+    # Cleanup old tracks from memory (does not remove cards from the hand)
     old = [tid for tid, tr in hand_state["tracks"].items() if frame_idx - tr["last_seen"] > drop_frames]
     for tid in old:
         hand_state["tracks"].pop(tid, None)
 
-    return sorted(hand_state["hand_ranks"]), new_card_added, visible_any
+    ranks_sorted = sorted([r for (r, _s) in hand_state["hand_cards"]])
+    return ranks_sorted, new_card_added, visible_any
 
 
 # -----------------------------
@@ -269,11 +280,11 @@ def main(video_source, model_weights, policy_model_path, log_dir):
 
         frame_idx += 1
 
-        # YOLO tracking (BoT-SORT default, ByteTrack if tracker=bytetrack.yaml) :contentReference[oaicite:1]{index=1}
+        # Tracking inference (ByteTrack / BoT-SORT)
         results = yolo_model.track(
             frame,
             persist=True,
-            tracker="bytetrack.yaml",  # or "botsort.yaml"
+            tracker="bytetrack.yaml",  # or "botsort.yaml" if IDs are unstable
             conf=MIN_CONF,
             verbose=False
         )[0]
@@ -284,26 +295,30 @@ def main(video_source, model_weights, policy_model_path, log_dir):
             stable_frames=STABLE_FRAMES,
             vote_ratio=VOTE_RATIO,
             min_center_dist_ratio=MIN_CENTER_DIST_RATIO,
-            max_per_rank=1,
         )
 
-        # end of hand detection
+        # End hand / reset only after sustained "no cards"
         if not visible_any:
             no_card_frames += 1
             if no_card_frames >= RESET_FRAMES:
                 if current_hand_active:
-                    # close out current hand
-                    final_cards = sorted(hand_state["hand_ranks"])
-                    card_count = len(final_cards)
-                    total_value = compute_hand_value(final_cards)
+                    final_cards = list(hand_state["hand_cards"])
+                    final_ranks = sorted([r for (r, _s) in final_cards])
+
+                    card_count = len(final_ranks)
+                    total_value = compute_hand_value(final_ranks)
                     prob_draw = predict_draw(policy_net, card_count, total_value) if card_count > 0 else 0.0
                     decision = "YES" if prob_draw >= 0.5 else "NO"
+
+                    # Full identities for CSV (rank+suit), e.g. "Kc Kd"
+                    cards_full_str = " ".join(sorted([card_to_string(r, s) for (r, s) in final_cards]))
 
                     print(f"--- End of hand {current_hand_id} ---")
 
                     hands_log.append({
                         "hand_id": current_hand_id,
-                        "cards": " ".join(final_cards),
+                        "cards_ranks": " ".join(final_ranks),
+                        "cards_full": cards_full_str,
                         "card_count": card_count,
                         "total_value": total_value,
                         "draw_probability": prob_draw,
@@ -321,7 +336,7 @@ def main(video_source, model_weights, policy_model_path, log_dir):
                 current_hand_active = True
                 print(f"=== New hand started: {current_hand_id} ===")
 
-            # only calculate and display when a new card is added
+            # Only print / compute when a NEW card is added
             if new_added:
                 card_count = len(ranks_sorted)
                 total_value = compute_hand_value(ranks_sorted)
@@ -334,19 +349,44 @@ def main(video_source, model_weights, policy_model_path, log_dir):
                     f"draw?: {decision} ({prob_draw:.2f})"
                 )
 
+                # Display only ranks (no suit on screen)
                 last_display_info = (card_count, total_value, prob_draw, decision, ranks_sorted)
 
-        # Annotate frame with YOLO + text
-        annotated_frame = results.plot()  # YOLO draws boxes and labels
+        # Visualization
+        annotated_frame = results.plot()
 
         if last_display_info is not None:
             card_count, total_value, prob_draw, decision, ranks_sorted = last_display_info
-            cv2.putText(annotated_frame, f"Cards: {card_count}, Total: {total_value}",
-                        (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(annotated_frame, f"Draw?: {decision} ({prob_draw:.2f})",
-                        (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(annotated_frame, f"Cards: {' '.join(ranks_sorted)}",
-                        (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(
+                annotated_frame,
+                f"Cards: {card_count}, Total: {total_value}",
+                (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                annotated_frame,
+                f"Draw?: {decision} ({prob_draw:.2f})",
+                (20, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                annotated_frame,
+                f"Cards: {' '.join(ranks_sorted)}",
+                (20, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
 
         cv2.imshow(f"Blackjack card detection (YOLO) | model: {model_weights}", annotated_frame)
 
@@ -357,21 +397,28 @@ def main(video_source, model_weights, policy_model_path, log_dir):
     cap.release()
     cv2.destroyAllWindows()
 
-    # Finalize: write CSV log
+    # Write CSV (one row per hand)
     with open(log_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["hand_id", "cards", "card_count", "total_value", "draw_probability", "draw_decision"])
+        writer.writerow([
+            "hand_id",
+            "cards_ranks",
+            "cards_full",
+            "card_count",
+            "total_value",
+            "draw_probability",
+            "draw_decision",
+        ])
         for row in hands_log:
-            writer.writerow(
-                [
+            writer.writerow([
                 row["hand_id"],
-                row["cards"],
+                row["cards_ranks"],
+                row["cards_full"],
                 row["card_count"],
                 row["total_value"],
                 f"{row['draw_probability']:.4f}",
                 row["draw_decision"],
-                ]
-            )
+            ])
 
     print(f"Log file saved to: {log_path}")
 
@@ -381,31 +428,10 @@ def main(video_source, model_weights, policy_model_path, log_dir):
 # -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--source",
-        type=str,
-        default="0",
-        help="Video source (0 = camera, 'video.mp4' = file)",
-    )
-    parser.add_argument(
-        "--weights",
-        type=str,
-        default="yolov8_30.pt",
-        help="Path to YOLOv8 model weights file",
-    )
-    parser.add_argument(
-        "--policy",
-        type=str,
-        default="training/torch/blackjack_model.pth",
-        help="Path to PyTorch policy model (draw / no draw)",
-    )
-    parser.add_argument(
-        "--logdir",
-        type=str,
-        default="logs",
-        help="Directory where log CSV will be saved",
-    )
-
+    parser.add_argument("--source", type=str, default="0", help="Video source (0 = camera, 'video.mp4' = file)")
+    parser.add_argument("--weights", type=str, default="training/yolo/yolov8/yolov8m_e100.pt", help="Path to YOLO model weights file")
+    parser.add_argument("--policy", type=str, default="training/torch/blackjack_model.pth", help="Path to PyTorch policy model (draw / no draw)")
+    parser.add_argument("--logdir", type=str, default="logs", help="Directory where log CSV will be saved")
     args = parser.parse_args()
 
     # Source may be int (webcam) or string (file)
