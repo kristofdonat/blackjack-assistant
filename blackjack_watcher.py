@@ -12,8 +12,13 @@ import torch.nn as nn
 
 # -----------------------------
 #  POLICY MODEL: "Should we draw?" (x1 = card count, x2 = total value)
+#  UPDATED:
+#   - supports checkpoint saved as dict with: model_state_dict + feature_mean/std
+#   - supports older "state_dict only"
+#   - supports both architectures (old sigmoid-output and new logits-output)
 # -----------------------------
-class BlackjackNet(nn.Module):
+class BlackjackNetV1(nn.Module):
+    """Old: outputs probability directly (ends with Sigmoid)."""
     def __init__(self):
         super().__init__()
         self.model = nn.Sequential(
@@ -22,29 +27,74 @@ class BlackjackNet(nn.Module):
             nn.Linear(16, 8),
             nn.ReLU(),
             nn.Linear(8, 1),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
         return self.model(x)
 
 
-def load_policy_model(path: str) -> BlackjackNet:
-    net = BlackjackNet()
-    state = torch.load(path, weights_only=True, map_location="cpu")
-    net.load_state_dict(state)
-    net.eval()
-    return net
+class BlackjackNetV2(nn.Module):
+    """New: outputs logits (no Sigmoid)."""
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
-def predict_draw(net: BlackjackNet, card_count: int, total_value: int) -> float:
-    """
-    Returns probability that we should draw another card (0..1).
-    x1 = card_count, x2 = total_value
-    """
+class PolicyModel:
+    def __init__(self, net: nn.Module, mean: torch.Tensor, std: torch.Tensor, outputs_logits: bool):
+        self.net = net
+        self.mean = mean
+        self.std = std
+        self.outputs_logits = outputs_logits
+
+
+def load_policy_model(path: str) -> PolicyModel:
+    obj = torch.load(path, map_location="cpu")
+
+    # New checkpoint format: dict with model_state_dict + scaler
+    if isinstance(obj, dict) and "model_state_dict" in obj:
+        state = obj["model_state_dict"]
+        mean = torch.tensor(obj.get("feature_mean", [[0.0, 0.0]]), dtype=torch.float32)
+        std = torch.tensor(obj.get("feature_std", [[1.0, 1.0]]), dtype=torch.float32)
+    else:
+        # Old format: state_dict only (no scaler)
+        state = obj
+        mean = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+        std = torch.tensor([[1.0, 1.0]], dtype=torch.float32)
+
+    # Try to load into V2 first (logits model), then fallback to V1 (sigmoid model)
+    net_v2 = BlackjackNetV2()
+    try:
+        net_v2.load_state_dict(state, strict=True)
+        net_v2.eval()
+        return PolicyModel(net=net_v2, mean=mean, std=std, outputs_logits=True)
+    except Exception:
+        pass
+
+    net_v1 = BlackjackNetV1()
+    net_v1.load_state_dict(state, strict=True)
+    net_v1.eval()
+    return PolicyModel(net=net_v1, mean=mean, std=std, outputs_logits=False)
+
+
+def predict_draw(policy: PolicyModel, card_count: int, total_value: int) -> float:
     with torch.no_grad():
-        x = torch.tensor([[float(card_count), float(total_value)]])
-        return net(x).item()
+        x = torch.tensor([[float(card_count), float(total_value)]], dtype=torch.float32)
+        x = (x - policy.mean) / policy.std
+        out = policy.net(x)
+        if policy.outputs_logits:
+            return torch.sigmoid(out).item()
+        return out.item()
 
 
 # -----------------------------
@@ -134,7 +184,7 @@ def update_hand_from_tracking(
     frame_idx: int,
     frame_shape,
     hand_state: dict,
-    min_conf: float = 0.5,
+    min_conf: float = 0.55,
     stable_frames: int = 5,
     vote_ratio: float = 0.7,
     drop_frames: int = 30,
@@ -241,7 +291,7 @@ def main(video_source, model_weights, policy_model_path, log_dir):
     # Load YOLO model
     yolo_model = YOLO(model_weights)
 
-    policy_net = load_policy_model(policy_model_path)
+    policy = load_policy_model(policy_model_path)
 
     # Prepare logging
     log_dir = Path(log_dir)
@@ -310,7 +360,7 @@ def main(video_source, model_weights, policy_model_path, log_dir):
 
                     card_count = len(final_ranks)
                     total_value = compute_hand_value(final_ranks)
-                    prob_draw = predict_draw(policy_net, card_count, total_value) if card_count > 0 else 0.0
+                    prob_draw = predict_draw(policy, card_count, total_value) if card_count > 0 else 0.0
                     decision = "YES" if prob_draw >= 0.5 else "NO"
 
                     # Full identities for CSV (rank+suit), e.g. "Kc Kd"
@@ -343,7 +393,7 @@ def main(video_source, model_weights, policy_model_path, log_dir):
             if new_added:
                 card_count = len(ranks_sorted)
                 total_value = compute_hand_value(ranks_sorted)
-                prob_draw = predict_draw(policy_net, card_count, total_value)
+                prob_draw = predict_draw(policy, card_count, total_value)
                 decision = "YES" if prob_draw >= 0.5 else "NO"
 
                 print(
