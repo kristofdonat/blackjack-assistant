@@ -25,6 +25,29 @@ This project combines two ML components:
   - cards appear again → **new hand starts**
 - Writes a **CSV logfile** at the end of the run.
 
+## Recommended running
+Paste this into the terminal, or just run blackjack_watcher.py with the required arguments
+`python blackjack_watcher.py --source 0`
+
+The project can be run with the following command-line arguments:
+
+- `--source` (str, default: `"0"`)
+  - **What it does:** Sets the video input source.
+  - **Default behavior:** `"0"` uses the default camera/webcam. You can also pass a video file path (e.g., `"video.mp4"`).
+  - **Sample videos:** `"training/sample_videos"` we have some sample videos to try out with, if you don't have a default camera (e.g., `"cards1.mp4"`).
+
+- `--weights` (str, default: `"training/yolo/yolov8/yolov8m_e100.pt"`)
+  - **What it does:** Path to the YOLO model weights used for detection.
+  - **Default behavior:** Loads YOLO weights from `training/yolo/yolov8/yolov8m_e100.pt`.
+
+- `--policy` (str, default: `"training/torch/blackjack_model.pth"`)
+  - **What it does:** Path to the PyTorch policy model used to decide **draw / no draw**.
+  - **Default behavior:** Loads the policy model from `training/torch/blackjack_model.pth`.
+
+- `--logdir` (str, default: `"logs"`)
+  - **What it does:** Directory where the run will write log output (CSV).
+  - **Default behavior:** Saves logs into the `logs/` folder.
+
 
 ## Dataset
 

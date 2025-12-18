@@ -59,7 +59,7 @@ class PolicyModel:
 
 
 def load_policy_model(path: str) -> PolicyModel:
-    obj = torch.load(path, map_location="cpu")
+    obj = torch.load(path, map_location="cpu", weights_only=False)
 
     # New checkpoint format: dict with model_state_dict + scaler
     if isinstance(obj, dict) and "model_state_dict" in obj:
